@@ -1,0 +1,149 @@
+From 5d9be44de0af4161526cbc805a7ddbc66a8e5966 Mon Sep 17 00:00:00 2001
+From: Riccardo Mancini <r.mancini@santannapisa.it>
+Date: Sun, 23 Jun 2019 19:53:45 +0200
+Subject: [PATCH 2/4] Added knapid kernel threads
+
+The threads are created using the  cpu hotplug interface
+in smpboot.h
+---
+ net/core/dev.c | 89 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 007f3e15836a..a195a3a4e53e 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -142,6 +142,8 @@
+ #include <linux/net_namespace.h>
+ #include <linux/indirect_call_wrapper.h>
+ #include <net/devlink.h>
++#include <linux/kthread.h>
++#include <linux/smpboot.h>
+ 
+ #include "net-sysfs.h"
+ 
+@@ -164,6 +166,16 @@ static int call_netdevice_notifiers_extack(unsigned long val,
+ 					   struct netlink_ext_ack *extack);
+ static struct napi_struct *napi_by_id(unsigned int napi_id);
+ 
++
++#ifdef CONFIG_THREADED_NAPI
++
++int knapid_enabled __read_mostly = 1;
++
++DEFINE_PER_CPU(struct task_struct *, knapid);
++DEFINE_PER_CPU(int, napi_running);
++
++#endif
++
+ /*
+  * The @dev_base_head list is protected by @dev_base_lock and the rtnl
+  * semaphore.
+@@ -3974,6 +3986,34 @@ int dev_tx_weight __read_mostly = 64;
+ 
+ #ifdef CONFIG_THREADED_NAPI
+ 
++static inline void wakeup_napid(void)
++{
++	/* Interrupts are disabled: no need to stop preemption */
++	struct task_struct *tsk = __this_cpu_read(knapid);
++
++	if (tsk && tsk->state != TASK_RUNNING)
++		wake_up_process(tsk);
++}
++
++static inline int napid_running(void)
++{
++	/* Interrupts are disabled: no need to stop preemption */
++	struct task_struct *tsk = __this_cpu_read(knapid);
++
++	return tsk && tsk->state == TASK_RUNNING;
++}
++
++/* Called with irq disabled */
++static inline void ______napi_schedule(void)
++{
++	if (!knapid_enabled){
++		__raise_softirq_irqoff(NET_RX_SOFTIRQ);
++	} else{
++		wakeup_napid();
++	}
++	
++}
++
+ #else
+ 
+ /* Called with irq disabled */
+@@ -6435,6 +6475,39 @@ static __latent_entropy int napi_poll_everything(void)
+ 
+ #ifdef CONFIG_THREADED_NAPI
+ 
++static void net_rx_action(struct softirq_action *h)
++{
++	if (napi_poll_everything()){
++		// I still have work to do
++		if (!knapid_enabled)
++			raise_softirq(NET_RX_SOFTIRQ);
++	}
++}
++
++static void run_knapid(unsigned int cpu){
++	napi_poll_everything();
++}
++
++static int knapid_should_run(unsigned int cpu)
++{
++	int ret;
++	struct softnet_data *sd;
++	
++	local_irq_disable();
++	sd = this_cpu_ptr(&softnet_data);
++	ret = !list_empty(&sd->poll_list);
++	local_irq_enable();
++
++	if (ret){
++		// I still have work to do
++		if (!knapid_enabled){
++			return 0;
++		} else
++			return 1;
++	} else
++		return 0;
++}
++
+ #else
+ 
+ static void net_rx_action(struct softirq_action *h)
+@@ -9795,6 +9868,17 @@ static struct pernet_operations __net_initdata default_device_ops = {
+  *
+  */
+ 
++#ifdef CONFIG_THREADED_NAPI
++
++static struct smp_hotplug_thread napi_threads = {
++	.store			= &knapid,
++	.thread_should_run	= knapid_should_run,
++	.thread_fn		= run_knapid,
++	.thread_comm		= "knapid/%u",
++};
++
++#endif
++
+ /*
+  *       This is called single threaded during boot, so no need
+  *       to take the rtnl semaphore.
+@@ -9868,6 +9952,11 @@ static int __init net_dev_init(void)
+ 	open_softirq(NET_TX_SOFTIRQ, net_tx_action);
+ 	open_softirq(NET_RX_SOFTIRQ, net_rx_action);
+ 
++#ifdef CONFIG_THREADED_NAPI
++	this_cpu_write(napi_running, 0);
++	BUG_ON(smpboot_register_percpu_thread(&napi_threads));
++#endif
++
+ 	rc = cpuhp_setup_state_nocalls(CPUHP_NET_DEV_DEAD, "net/dev:dead",
+ 				       NULL, dev_cpu_dead);
+ 	WARN_ON(rc < 0);
+-- 
+2.21.0
+

@@ -1,0 +1,182 @@
+From 093e59d29c0c4f0554745f1f68e95437d4ddcecb Mon Sep 17 00:00:00 2001
+From: Riccardo Mancini <r.mancini@santannapisa.it>
+Date: Sun, 23 Jun 2019 22:18:03 +0200
+Subject: [PATCH 4/4] Added sysctl option to enable threaded napi at runtime
+
+A delay is needed since switching too fast creates bugs in the approach
+I used. The proper way would have been using some sort of syncronization
+mechanism but in this case it is not trivial. In the way the threaded
+NAPI is written, bugs can only occour if the value is switched too fast,
+within a napi poll. This limitation won't hurt users since I don't think
+anyone would want to change it that fast.
+---
+ include/linux/netdevice.h  |  4 ++++
+ kernel/sysctl_binary.c     |  3 +++
+ net/core/dev.c             | 29 ++++++++++++++++++++++++++-
+ net/core/sysctl_net_core.c | 41 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index eeacebd7debb..3da3875a0093 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -368,6 +368,10 @@ enum gro_result {
+ };
+ typedef enum gro_result gro_result_t;
+ 
++#ifdef CONFIG_THREADED_NAPI
++extern int knapid_enabled;
++#endif
++
+ /*
+  * enum rx_handler_result - Possible return values for rx_handlers.
+  * @RX_HANDLER_CONSUMED: skb was consumed by rx_handler, do not process it
+diff --git a/kernel/sysctl_binary.c b/kernel/sysctl_binary.c
+index 73c132095a7b..813e6c3ee2b0 100644
+--- a/kernel/sysctl_binary.c
++++ b/kernel/sysctl_binary.c
+@@ -196,6 +196,9 @@ static const struct bin_table bin_net_core_table[] = {
+ 	{ CTL_INT,	NET_CORE_DEV_WEIGHT,	"dev_weight" },
+ 	{ CTL_INT,	NET_CORE_SOMAXCONN,	"somaxconn" },
+ 	{ CTL_INT,	NET_CORE_BUDGET,	"netdev_budget" },
++	#ifdef CONFIG_THREADED_NAPI
++	{ CTL_INT,	NET_CORE_KNAPID,	"knapid_enabled" },
++	#endif
+ 	{ CTL_INT,	NET_CORE_AEVENT_ETIME,	"xfrm_aevent_etime" },
+ 	{ CTL_INT,	NET_CORE_AEVENT_RSEQTH,	"xfrm_aevent_rseqth" },
+ 	{ CTL_INT,	NET_CORE_WARNINGS,	"warnings" },
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 7629651f3485..fceccdf77719 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -6429,19 +6429,38 @@ static __latent_entropy int napi_poll_everything(void)
+ 	int budget = netdev_budget;
+     	int ret = 0;
+ 
++#ifdef CONFIG_THREADED_NAPI
++	int was_napi_running;
++#endif
++
+ 	LIST_HEAD(list);
+ 	LIST_HEAD(repoll);
+ 
+ 	local_irq_disable();
+ 	list_splice_init(&sd->poll_list, &list);
++
++#ifdef CONFIG_THREADED_NAPI
++	was_napi_running = __this_cpu_read(napi_running);
++	 __this_cpu_write(napi_running, 1);
++#endif
++
+ 	local_irq_enable();
+ 
++#ifdef CONFIG_THREADED_NAPI
++	if (was_napi_running)
++		return 0;
++#endif
++
+ 	for (;;) {
+ 		struct napi_struct *n;
+ 
+ 		if (list_empty(&list)) {
+-			if (!sd_has_rps_ipi_waiting(sd) && list_empty(&repoll))
++			if (!sd_has_rps_ipi_waiting(sd) && list_empty(&repoll)){
++#ifdef CONFIG_THREADED_NAPI
++				this_cpu_write(napi_running, 0);
++#endif
+ 				goto out;
++			}
+ 			break;
+ 		}
+ 
+@@ -6467,6 +6486,10 @@ static __latent_entropy int napi_poll_everything(void)
+ 	if (!list_empty(&sd->poll_list))
+ 		ret = 1;
+ 
++#ifdef CONFIG_THREADED_NAPI
++	__this_cpu_write(napi_running, 0);
++#endif
++
+ 	net_rps_action_and_irq_enable(sd);
+ out:
+ 	__kfree_skb_flush();
+@@ -6481,6 +6504,9 @@ static void net_rx_action(struct softirq_action *h)
+ 		// I still have work to do
+ 		if (!knapid_enabled)
+ 			raise_softirq(NET_RX_SOFTIRQ);
++		else{
++			wakeup_napid();
++		}
+ 	}
+ }
+ 
+@@ -6501,6 +6527,7 @@ static int knapid_should_run(unsigned int cpu)
+ 	if (ret){
+ 		// I still have work to do
+ 		if (!knapid_enabled){
++			raise_softirq(NET_RX_SOFTIRQ);
+ 			return 0;
+ 		} else
+ 			return 1;
+diff --git a/net/core/sysctl_net_core.c b/net/core/sysctl_net_core.c
+index 1a2685694abd..8c25ae019c9f 100644
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@ -313,6 +313,36 @@ proc_dolongvec_minmax_bpf_restricted(struct ctl_table *table, int write,
+ }
+ #endif
+ 
++#ifdef CONFIG_THREADED_NAPI
++unsigned long next_allowed_knapid_enable = 0;
++static int KNAPID_ENABLE_INTERVAL = 10000000;
++DEFINE_MUTEX(knapid_enable_mutex);
++
++static int proc_dointvec_minmax_knapid_enable(struct ctl_table *table, int write,
++					   void __user *buffer, size_t *lenp,
++					   loff_t *ppos)
++{
++	int ret, old_val;
++
++	mutex_lock(&knapid_enable_mutex);
++
++	old_val = knapid_enabled;
++
++	if (write && time_before(jiffies, next_allowed_knapid_enable)){
++		ret = -EPERM;
++		goto out;
++ 	}
++
++	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++
++	if (knapid_enabled != old_val)
++		next_allowed_knapid_enable = jiffies + usecs_to_jiffies(KNAPID_ENABLE_INTERVAL);
++out:
++	mutex_unlock(&knapid_enable_mutex);
++	return ret;
++}
++#endif
++
+ static struct ctl_table net_core_table[] = {
+ #ifdef CONFIG_NET
+ 	{
+@@ -562,6 +592,17 @@ static struct ctl_table net_core_table[] = {
+ 		.extra1		= &zero,
+ 		.extra2		= &two,
+ 	},
++#ifdef CONFIG_THREADED_NAPI
++	{
++		.procname	= "knapid_enable",
++		.data		= &knapid_enabled,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax_knapid_enable,
++		.extra1		= &zero,
++		.extra2		= &one,		
++	},
++#endif
+ 	{ }
+ };
+ 
+-- 
+2.21.0
+

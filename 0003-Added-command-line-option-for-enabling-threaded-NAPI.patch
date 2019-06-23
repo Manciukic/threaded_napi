@@ -1,0 +1,42 @@
+From 1a74673a3667d0a247f6d95a8cfc2c940a98fb85 Mon Sep 17 00:00:00 2001
+From: Riccardo Mancini <r.mancini@santannapisa.it>
+Date: Sun, 23 Jun 2019 19:54:05 +0200
+Subject: [PATCH 3/4] Added command line option for enabling threaded NAPI
+
+---
+ net/core/dev.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index a195a3a4e53e..7629651f3485 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -9966,3 +9966,25 @@ static int __init net_dev_init(void)
+ }
+ 
+ subsys_initcall(net_dev_init);
++
++#ifdef CONFIG_THREADED_NAPI
++
++static __init int threaded_napi_cmdline(char *str)
++{
++	if (!str)
++		return -EINVAL;
++
++	if (!strcmp(str, "off")) {
++		knapid_enabled = 0;
++	} else if (!strcmp(str, "on")) {
++		knapid_enabled = 1;
++	} else{
++		return -EINVAL;
++	}
++	
++	return 0;
++}
++
++__setup("threaded_napi=", threaded_napi_cmdline);
++
++#endif
+-- 
+2.21.0
+
